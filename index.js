@@ -1,100 +1,108 @@
-import {
-  default as makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion
-} from '@whiskeysockets/baileys'
+import makeWASocket, {
+    DisconnectReason,
+    useSingleFileAuthState,
+    fetchLatestBaileysVersion,
+    makeInMemoryStore,
+} from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import P from "pino";
 
-import P from 'pino'
-import qrcode from 'qrcode-terminal'
+// --- Auth and store setup ---
+const { state, saveState } = useSingleFileAuthState('./auth_info.json');
+const store = makeInMemoryStore({ logger: P().child({ level: 'silent', stream: 'store' }) });
 
-// OPTIONAL: put your phone number here for pairing code
-// Format: countrycode + number, NO +
-const PAIRING_NUMBER = '' // e.g. 254712345678
-
+// --- Start bot ---
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth')
-  const { version } = await fetchLatestBaileysVersion()
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: P({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '22.04'],
-    printQRInTerminal: false
-  })
-
-  // Save session
-  sock.ev.on('creds.update', saveCreds)
-
-  // CONNECTION EVENTS
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-
-    // ===== QR CODE =====
-    if (qr) {
-      console.log('\n📲 Scan this QR Code:\n')
-      qrcode.generate(qr, { small: true })
-    }
-
-    // ===== PAIRING CODE =====
-    if (
-      !state.creds.registered &&
-      PAIRING_NUMBER &&
-      connection === 'connecting'
-    ) {
-      try {
-        const code = await sock.requestPairingCode(PAIRING_NUMBER)
-        console.log('\n🔗 Pairing Code:', code)
-        console.log('📱 WhatsApp → Linked Devices → Link with phone number\n')
-      } catch (err) {
-        console.log('❌ Pairing code error:', err?.message)
-      }
-    }
-
-    if (connection === 'open') {
-      console.log('✅ WhatsApp Connected Successfully')
-    }
-
-    if (connection === 'close') {
-      const reason = lastDisconnect?.error?.output?.statusCode
-      console.log('❌ Connection closed')
-
-      if (reason !== DisconnectReason.loggedOut) {
-        console.log('🔄 Reconnecting...')
-        startBot()
-      } else {
-        console.log('🚫 Logged out. Delete auth folder and restart.')
-      }
-    }
-  })
-
-  // ===== SAFE ONLINE PRESENCE (LOW RATE) =====
-  setInterval(async () => {
     try {
-      await sock.sendPresenceUpdate('available')
-    } catch {}
-  }, 45_000)
+        const { version } = await fetchLatestBaileysVersion();
+        console.log(`Using WA version v${version.join('.')}`);
 
-  // ===== FAKE TYPING / RECORDING (NO REPLY) =====
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg?.key?.remoteJid || msg.key.fromMe) return
+        const sock = makeWASocket({
+            version,
+            printQRInTerminal: true,
+            auth: state,
+            logger: P({ level: 'silent' }),
+        });
 
-    const jid = msg.key.remoteJid
+        store.bind(sock.ev);
 
-    try {
-      await sock.sendPresenceUpdate('composing', jid)
+        // --- Connection updates ---
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr, pairingCode } = update;
 
-      setTimeout(async () => {
-        await sock.sendPresenceUpdate('recording', jid)
-      }, 2000)
+            if (qr) console.log('📸 QR code:', qr);
+            if (pairingCode) console.log('🔑 Pairing code:', pairingCode);
 
-      setTimeout(async () => {
-        await sock.sendPresenceUpdate('available', jid)
-      }, 5000)
-    } catch {}
-  })
+            if (connection === 'close') {
+                const reason = new Boom(lastDisconnect?.error).output.statusCode;
+                console.log('❌ Connection closed. Reason:', reason);
+                if (reason === DisconnectReason.loggedOut) {
+                    console.log('🛑 Logged out. Delete auth file and restart.');
+                } else {
+                    console.log('🔄 Reconnecting...');
+                    startBot();
+                }
+            } else if (connection === 'open') {
+                console.log('✅ Connected to WhatsApp!');
+            }
+        });
+
+        // --- Save auth updates ---
+        sock.ev.on('creds.update', saveState);
+
+        // --- Message handler ---
+        sock.ev.on('messages.upsert', async (msg) => {
+            try {
+                const messages = msg.messages;
+                if (!messages || !messages.length) return;
+
+                const message = messages[0];
+                if (!message.message || message.key.fromMe) return;
+
+                const sender = message.key.remoteJid;
+                const text = message.message.conversation || message.message.extendedTextMessage?.text;
+                if (!text) return;
+
+                console.log(`📩 Message from ${sender}: ${text}`);
+
+                // --- Command handling ---
+                if (text.startsWith('!')) {
+                    const cmd = text.slice(1).trim().toLowerCase();
+
+                    switch(cmd) {
+                        case 'ping':
+                            await sock.sendMessage(sender, { text: '🏓 Pong!' });
+                            break;
+                        case 'help':
+                            await sock.sendMessage(sender, { text: 'Commands:\n!ping\n!help' });
+                            break;
+                        default:
+                            await sock.sendMessage(sender, { text: `❓ Unknown command: ${cmd}` });
+                    }
+                } else {
+                    // --- AI response (demo/mock) ---
+                    const reply = `🤖 You said: "${text}"`;
+                    await sock.sendMessage(sender, { text: reply });
+                }
+
+            } catch (err) {
+                console.log('❌ Message handler error:', err);
+            }
+        });
+
+        // --- Keep-alive log for Railway ---
+        setInterval(() => {
+            console.log('🤖 Bot is alive...');
+        }, 60_000);
+
+    } catch (err) {
+        console.log('❌ Error starting bot:', err);
+    }
 }
 
-startBot()
+// --- Global error handling ---
+process.on('uncaughtException', (err) => console.log('❌ Uncaught Exception:', err));
+process.on('unhandledRejection', (reason) => console.log('❌ Unhandled Rejection:', reason));
+
+// --- Launch bot ---
+startBot();
