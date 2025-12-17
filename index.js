@@ -1,106 +1,72 @@
 import makeWASocket, {
   useMultiFileAuthState,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from '@whiskeysockets/baileys'
 
-import qrcode from "qrcode-terminal";
+import P from 'pino'
+import qrcode from 'qrcode-terminal'
 
-let sock;
-let presenceInterval = null;
+const randomDelay = (min, max) =>
+  Math.floor(Math.random() * (max - min + 1)) + min
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("session");
+  const { state, saveCreds } = await useMultiFileAuthState('session')
+  const { version } = await fetchLatestBaileysVersion()
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
+    version,
+    logger: P({ level: 'silent' }),
     auth: state,
-    printQRInTerminal: false,
-    browser: ["Chrome", "Windows", "10"],
-    syncFullHistory: false,
+    browser: ['Ubuntu', 'Chrome', '22.04'],
     markOnlineOnConnect: true
-  });
+  })
 
-  // 🔗 CONNECTION UPDATES
-  sock.ev.on("connection.update", (update) => {
-    const { connection, qr, lastDisconnect } = update;
+  sock.ev.on('creds.update', saveCreds)
 
-    // 📲 QR CODE
+  // QR + connection
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update
+
     if (qr) {
-      console.clear();
-      console.log("📲 Scan this QR with WhatsApp → Linked Devices");
-      qrcode.generate(qr, { small: true });
+      console.log('📲 Scan QR to login')
+      qrcode.generate(qr, { small: true })
     }
 
-    // ✅ CONNECTED
-    if (connection === "open") {
-      console.log("✅ WhatsApp Bot Connected Successfully!");
-
-      // 🟢 Always online
-      if (!presenceInterval) {
-        presenceInterval = setInterval(async () => {
-          try {
-            await sock.sendPresenceUpdate("available");
-          } catch (err) {
-            console.log("⚠️ Presence error:", err.message);
-          }
-        }, 20000); // every 20 seconds
-      }
+    if (connection === 'open') {
+      console.log('✅ WhatsApp connected')
     }
 
-    // ❌ DISCONNECTED
-    if (connection === "close") {
-      console.log("❌ Connection closed");
+    if (connection === 'close') {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
 
-      if (presenceInterval) {
-        clearInterval(presenceInterval);
-        presenceInterval = null;
-      }
-
-      const reason = lastDisconnect?.error?.output?.statusCode;
-
-      if (reason !== DisconnectReason.loggedOut) {
-        console.log("🔄 Reconnecting...");
-        startBot();
-      } else {
-        console.log("🚫 Logged out. Delete session folder and rescan QR.");
-      }
+      console.log('❌ Disconnected. Reconnecting:', shouldReconnect)
+      if (shouldReconnect) startBot()
     }
-  });
+  })
 
-  // 💾 SAVE SESSION
-  sock.ev.on("creds.update", saveCreds);
+  // 👇 FAKE TYPING & RECORDING (NO MESSAGE SENT)
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
 
-  // 💬 MESSAGE HANDLER (Typing/Recording only)
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg?.message || msg.key.fromMe) return;
+    const msg = messages[0]
+    if (!msg.message || msg.key.fromMe) return
 
-    const jid = msg.key.remoteJid;
+    const jid = msg.key.remoteJid
+    if (!jid || jid.endsWith('@g.us')) return // ignore groups (safer)
 
-    try {
-      // ✍️ Fake typing
-      await sock.sendPresenceUpdate("composing", jid);
-      await delay(random(2000, 5000));
+    // Typing
+    await sock.sendPresenceUpdate('composing', jid)
+    await new Promise(r => setTimeout(r, randomDelay(2000, 5000)))
 
-      // 🎤 Fake recording
-      await sock.sendPresenceUpdate("recording", jid);
-      await delay(random(1000, 2500));
+    // Recording
+    await sock.sendPresenceUpdate('recording', jid)
+    await new Promise(r => setTimeout(r, randomDelay(2000, 4000)))
 
-      // ✅ Do NOT send any message (no autoreply)
-    } catch (err) {
-      console.log("⚠️ Presence update error:", err.message);
-    }
-  });
+    // Back to online
+    await sock.sendPresenceUpdate('available', jid)
+  })
 }
 
-// ⏳ Delay helper
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Random delay helper
-function random(min, max) {
-  return Math.floor(Math.random() * (max - min + 1) + min);
-}
-
-// 🚀 START BOT
-startBot();
+startBot()
